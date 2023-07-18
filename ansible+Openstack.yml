@@ -1,0 +1,409 @@
+---
+- name: Provision OpenStack instances using Heat
+  hosts: controller
+  gather_facts: false
+  become: yes
+  vars:
+    key_name: ansible-key
+    image: ubuntu_focal
+    flavor_master: m1.master-resize
+    flavor_worker: m1.worker-resize 
+    network: selfservice
+    security_group: default
+    instance_master_count: 1
+    instance_worker_count: 2
+
+    auth_url: http://controller:5000/v3/ 
+    username: admin_pi
+    password: 123456
+    project_name: pi_project
+    project_domain_name: PICLOUD
+    user_domain_name: PICLOUD
+    stack_name: my-stack
+    template_file: /root/kube/template.yaml
+
+    stack_parameters:
+      key_name: "{{ key_name }}"
+      image: "{{ image }}"
+      flavor_master: "{{ flavor_master }}"
+      flavor_worker: "{{ flavor_worker }}"
+      network: "{{ network }}"
+      security_group: "{{ security_group }}"
+      instance_master_count: "{{ instance_master_count }}"
+      instance_worker_count: "{{ instance_worker_count }}"
+
+  tasks:
+    - name: Create Heat stack
+      os_stack:
+        auth:
+          auth_url: http://controller:5000/v3/ 
+          username: admin_pi
+          password: 123456
+          project_name: pi_project
+          project_domain_name: PICLOUD
+          user_domain_name: PICLOUD
+        state: present
+        name: "{{ stack_name }}"
+        template: "{{ template_file }}"
+        parameters: "{{ stack_parameters }}"
+      register: stack_result
+
+    - name: Update inventory with new instances
+      add_host:
+        name: "{{ item.private_v4 }}"
+        groups: "{{ item.group }}"
+        ansible_user: ubuntu
+
+      with_items:
+        - { private_v4: "{{ stack_result.stack.outputs | selectattr('output_key','eq','master_instance_ip') | map(attribute='output_value') | first   }}", group: "master" }
+        - { private_v4: "{{ stack_result.stack.outputs | selectattr('output_key','eq','worker1_instance_ip') | map(attribute='output_value') | first   }}", group: "worker" }
+        - { private_v4: "{{ stack_result.stack.outputs | selectattr('output_key','eq','worker2_instance_ip') | map(attribute='output_value') | first   }}", group: "worker" }
+
+    - name: Wait for SSH connectivity on instances
+      wait_for:
+        host: "{{ item.private_v4 }}"
+        port: 22
+        delay: 3
+        timeout: 420
+        state: started
+      delegate_to: localhost
+      with_items:
+        - { private_v4: "{{ stack_result.stack.outputs | selectattr('output_key','eq','master_instance_ip') | map(attribute='output_value') | first   }}" }
+        - { private_v4: "{{ stack_result.stack.outputs | selectattr('output_key','eq','worker1_instance_ip') | map(attribute='output_value') | first   }}"}
+        - { private_v4: "{{ stack_result.stack.outputs | selectattr('output_key','eq','worker2_instance_ip') | map(attribute='output_value') | first   }}" }
+
+- hosts: "master, worker"
+  name: Setting up the kubernetes environment 
+  gather_facts: no
+  become: yes
+  remote_user: root
+  tasks:
+
+    - name: Create the kube user account
+      user: name=kube append=yes state=present createhome=yes shell=/bin/bash
+
+    - name: Allow 'kube' to use sudo without needing a password
+      lineinfile:
+        dest: /etc/sudoers
+        line: "kube ALL=(ALL) NOPASSWD: ALL"
+        validate: "visudo -cf %s"
+
+    - name: Set up authorized keys for the kube user
+      authorized_key: user=kube key="{{item}}"
+      with_file:
+        - ~/.ssh/id_rsa.pub
+
+    - name: Make the Swap inactive
+      command: swapoff -a
+
+    - name: Remove Swap entry from /etc/fstab.
+      lineinfile:
+        dest: /etc/fstab
+        regexp: swap
+        state: absent
+
+    - name: Create a empty file for k8S module params.
+      copy:
+       content: ""
+       dest: /etc/modules-load.d/k8s.conf
+       force: no
+        
+    - name: Configure module for K8S
+      blockinfile:
+       dest: /etc/modules-load.d/k8s.conf 
+       block: |
+            overlay
+            br_netfilter
+
+    - name: Apply modprobe without reboot.
+      shell: | 
+        sudo modprobe overlay
+        sudo modprobe br_netfilter  
+
+    - name: Create a empty file for kubernetes sysctl params.
+      copy:
+       content: ""
+       dest: /etc/sysctl.d/k8s.conf
+       force: no
+
+    - name: Configure sysctl params for Kubernetes.
+      lineinfile:
+       path: /etc/sysctl.d/k8s.conf
+       line: "{{ item }}"
+      with_items:
+       - 'net.bridge.bridge-nf-call-iptables  = 1'
+       - 'net.ipv4.ip_forward                 = 1'
+       - 'net.bridge.bridge-nf-call-ip6tables = 1'
+
+    - name: Apply sysctl params without reboot.
+      command: sysctl --system
+
+    - name: Remove old docker packages
+      apt:
+        name:
+          - docker
+          - docker-engine
+          - docker.io
+          - containerd
+          - runc
+        state: absent
+
+    - name: Installing Prerequisites for Kubernetes & Docker
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - vim
+          - software-properties-common
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    #  - name: Apt update
+    #    shell: |
+    #     sudo apt-get update
+    #     sudo apt-get install gnupg lsb-release
+
+    - name: Create /etc/apt/keyrings folder
+      shell: |
+          sudo mkdir -m 0755 -p /etc/apt/keyrings
+    #       curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker's official GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        keyring: /etc/apt/keyrings/docker.gpg
+        state: present
+
+    - name: Set up Docker repository
+      shell: echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    #  - name: Install docker and containerd
+    #    shell: |
+    #     sudo apt-get update
+    #     sudo apt-get install -y  containerd.io
+
+    - name: Install containerd
+      apt:
+        name:
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Delete containerd config.toml
+      file:
+        path: /etc/containerd/config.toml
+        state: absent
+
+    - name: Enable containerd service, and start it.
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon-reload: yes
+
+    - name: Add Google official GPG key
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        keyring: /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+        state: present
+
+    - name: Add Kubernetes Repository
+      apt_repository:
+        repo: "deb  [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg]  http://apt.kubernetes.io/ kubernetes-xenial main"
+        state: present
+        filename: kubernetes
+        mode: 0600
+
+    - name: Installing Kubernetes Cluster Packages.
+      apt:
+        name:
+          - kubeadm
+          - kubectl
+          - kubelet
+        state: present
+        update_cache: yes
+    - name: Enable service kubelet, and enable persistently
+      service:
+        name: kubelet
+        enabled: yes
+
+- hosts: "master"
+  name: Creating the cluster and integrating cloud controller
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: Download kubeadm file
+      get_url:
+        url: https://raw.githubusercontent.com/HaniNechi/kubeadm/main/kubeadm.yml
+        dest: /etc/kubernetes/manifests/kubeadm.yml
+        mode: "0440"
+
+    - name: Download calico file
+      get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
+        dest: /etc/kubernetes/manifests/calico.yml
+        mode: "0440"
+
+    - name: Download cloud config file
+      get_url:
+        url: https://raw.githubusercontent.com/HaniNechi/kubeadm/main/cloud-config
+        dest: /etc/kubernetes/cloud-config
+        mode: "0440"
+         
+    - name:  pull kubernetes images
+      command: kubeadm config images pull
+
+    - name: Initialize the cluster
+      shell: kubeadm init --config /etc/kubernetes/manifests/kubeadm.yml --v=5
+      args:
+        chdir: $HOME
+        creates: cluster_initialized.txt
+
+    - name: Create .kube directory kube user
+      become: yes
+      become_user: kube
+      file:
+        path: $HOME/.kube
+        state: directory
+        mode: "0755"
+
+    - name: Copies admin.conf to kube user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/kube/.kube/config
+        remote_src: yes
+        owner: kube
+
+    - name: Create .kube directory root
+      become: yes
+      file:
+        path: /root/.kube
+        state: directory
+        mode: "0755"
+
+    - name: Copies admin.conf to root user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+    
+    - name: Create Secret 
+      become: yes
+      shell: kubectl create secret -n kube-system generic cloud-config --from-literal=cloud.conf="$(cat /etc/kubernetes/cloud-config)" --dry-run -o yaml > cloud-config-secret.yaml
+    
+    - name: Apply Secret 
+      become: yes
+      shell: kubectl apply -f cloud-config-secret.yaml 
+    
+    - name: RBAC resources ( cloud-controller-manager-roles )
+      become: yes
+      shell: kubectl apply -f https://raw.githubusercontent.com/kubernetes/cloud-provider-openstack/master/manifests/controller-manager/cloud-controller-manager-roles.yaml 
+
+    - name: RBAC resources ( cloud-controller-manager-role-bindings )
+      become: yes
+      shell: kubectl apply -f https://raw.githubusercontent.com/kubernetes/cloud-provider-openstack/master/manifests/controller-manager/cloud-controller-manager-role-bindings.yaml
+
+    - name: Openstack-cloud-controller-manager deamonset ( openstack-cloud-controller-manager-ds )
+      become: yes
+      shell: kubectl apply -f https://raw.githubusercontent.com/kubernetes/cloud-provider-openstack/master/manifests/controller-manager/openstack-cloud-controller-manager-ds.yaml
+
+    - name: Install Pod network
+      become: yes
+      shell: sudo kubectl apply -f /etc/kubernetes/manifests/calico.yml
+    
+
+- hosts: master
+  name: Generating the joinning file
+  gather_facts: no
+  become: yes
+  vars:
+    token: ""
+    ca_cert_hash: ""
+    api_server_endpoint: ""
+  tasks:
+    - name: Get the token for joining the worker nodes
+      become: yes
+      become_user: kube
+      shell: kubeadm token create --print-join-command
+      register: join_command
+
+    - name: Extract CA Cert Hash
+      set_fact:
+        ca_cert_hash: "{{ join_command.stdout.split()[-1] }}"
+        
+    - name: Extract Token
+      set_fact:
+        token: "{{ join_command.stdout.split()[-3] }}"
+
+    - name: Extract API Server Endpoint
+      set_fact:
+        api_server_endpoint: "{{ join_command.stdout.split()[-5].replace('https://','') }}"
+
+    - name: token
+      debug:
+       msg: "{{ token }}"
+    - name: hash
+      debug:
+       msg: "{{ ca_cert_hash }}"
+    - name: api
+      debug:
+       msg: "{{ api_server_endpoint }}"
+
+    - name: Create Join Configuration file
+      template:
+        src: join-conf.yml.j2
+        dest: join-conf.yml
+
+    - name: Debug
+      debug:
+        msg: "{{ join_command.stdout }}"
+
+- hosts: worker
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Copy the join file to workers 
+      copy:
+       src: join-conf.yml
+       dest: /tmp/join-conf.yml
+       mode: '0777'
+
+    - name: Join the Worker nodes to the cluster.
+      become: yes
+      shell: kubectl apply -f /tmp/join-conf.yml
+      register: joined_or_not
+
+- hosts: master 
+  name: Cinder integration 
+  become: yes 
+  gather_facts: no 
+  tasks:
+
+    - name: Create a directory if it does not exist
+      ansible.builtin.file:
+      path: /etc/kubernetes/manifests/cinder-csi-plugin
+      state: directory
+      mode: '0755'
+
+    - name: Download cinder-csi files
+      get_url:
+        url: "https://github.com/kubernetes/cloud-provider-openstack/blob/master/manifests/cinder-csi-plugin/{{ item }}"
+        dest: /etc/kubernetes/manifests/cinder-csi-plugin/
+        mode: "0440"
+        with_items: 
+         - cinder-csi-controllerplugin-rbac.yaml
+         - cinder-csi-controllerplugin.yaml
+         - cinder-csi-nodeplugin-rbac.yaml
+         - cinder-csi-nodeplugin.yaml
+         - csi-cinder-driver.yaml
+
+    - name: Deploying pcinder plugins
+      become: yes 
+      shell: kubectl -f /etc/kubernetes/manifests/cinder-csi-plugin/ apply 
+
+
